@@ -1,0 +1,27 @@
+{
+    "bucket_info": {},
+    "latex-delimiter-config": {
+        "display": {
+            "left": "$$",
+            "right": "$$"
+        },
+        "inline": {
+            "left": "$",
+            "right": "$"
+        }
+    },
+    "llm-aided-config": {
+        "title_aided": {
+            "api_key": "sk-admin",
+            "base_url": "http://s-20260716110819-fqdcz.ailab-opencompass.pjh-service.org.cn/v1",
+            "model": "GLM-5.2-FP8-ac",
+            "enable": true
+        }
+    },
+    "models-dir": {
+        "pipeline": "/home/zhengpujun/projects/mineru/model/models/OpenDataLab--PDF-Extract-Kit-1.0/snapshots/master",
+        "vlm": ""
+    },
+    "model-source": "modelscope",
+    "config_version": "1.3.2"
+}
