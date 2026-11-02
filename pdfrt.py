@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import asyncio
+import hashlib
 import logging
 import os
 import re
@@ -15,10 +16,6 @@ import requests
 from tqdm import tqdm
 
 import colorlog
-from loguru import logger as loguru_logger
-
-loguru_logger.remove()
-loguru_logger.add(sys.stderr, level="INFO")
 
 _handler = colorlog.StreamHandler()
 _handler.setFormatter(colorlog.ColoredFormatter(
@@ -50,17 +47,19 @@ BASE_DIR = Path(__file__).resolve().parent
 from dotenv import load_dotenv
 from openai import AsyncOpenAI, OpenAI
 
-load_dotenv(BASE_DIR / ".env")
+for env_file in (
+    Path.cwd() / ".env",
+    Path.home() / ".config" / "pdfrt" / ".env",
+    BASE_DIR / ".env",
+):
+    load_dotenv(env_file)
 
-MODEL_ID = os.environ["MODEL_ID"]
-API_BASE_URL = os.environ["API_BASE_URL"]
-API_KEY = os.environ["API_KEY"]
+MODEL_ID = os.environ.get("MODEL_ID", "")
+API_BASE_URL = os.environ.get("API_BASE_URL", "")
+API_KEY = os.environ.get("API_KEY", "")
 
-MINERU_API_URL = os.environ["MINERU_API_URL"]
-MINERU_API_AUTH = (
-    os.environ["MINERU_API_USER"],
-    os.environ["MINERU_API_PASS"],
-)
+MINERU_API_URL = os.environ.get("MINERU_API_URL", "https://mineru.net/api")
+MINERU_API_TOKEN = os.environ.get("MINERU_API_TOKEN", "") or os.environ.get("MINERU_API_KEY", "")
 
 TRANSLATE_MODEL = MODEL_ID
 GENERATE_MODEL = MODEL_ID
@@ -70,19 +69,20 @@ MAX_CHUNK = 3000
 MAX_PARSE_RETRIES = 3
 MAX_CONCURRENT_PDFS = 8
 
+DEFAULT_TIER = "advanced"
+TABLE_BLOCK_TYPES = {"table", "table_body", "table_caption", "table_footnote"}
+
 DEFAULT_LOCAL_DATA = {
-    "backend": "pipeline",
+    "tier": DEFAULT_TIER,
     "parse_method": "auto",
-    "lang": "en",
     "formula_enable": "true",
-    "table_enable": "true",
+    "table_enable": "false",
 }
 DEFAULT_REMOTE_DATA = {
-    "backend": "hybrid-engine",
-    "effort": "high",
+    "tier": DEFAULT_TIER,
+    "ocr_mode": "auto",
     "table_enable": "false",
-    "image_analysis": "true",
-    "response_format_zip": "true",
+    "output_formats": ["markdown", "zip"],
 }
 
 
@@ -104,69 +104,236 @@ def recognize_pdf(pdf_path: Path, output_dir: Path, mode: str, data: dict) -> No
 
 
 def _recognize_pdf_local(pdf_path: Path, output_dir: Path, data: dict) -> None:
-    import subprocess
-    mineru_bin = str(Path(sys.executable).parent / "mineru")
-    cmd = [
-        mineru_bin,
-        "-p", str(pdf_path),
-        "-o", str(output_dir),
-        "-b", data.get("backend", "pipeline"),
-        "-m", data.get("parse_method", "auto"),
-        "-l", data.get("lang", "en"),
-        "-f", data.get("formula_enable", "true"),
-        "-t", data.get("table_enable", "true"),
-    ]
-    log.info("[%s] Local mineru: %s", pdf_path.stem, " ".join(cmd))
-    env = {**os.environ, "MINERU_TOOLS_CONFIG_JSON": str(BASE_DIR / "mineru.json")}
-    result = subprocess.run(cmd, capture_output=True, text=True, env=env)
-    if result.returncode != 0:
-        stderr_tail = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "unknown error"
-        raise RuntimeError(f"mineru exit {result.returncode}: {stderr_tail}")
+    try:
+        from mineru.parser import parse
+    except ImportError as exc:
+        raise RuntimeError("mineru is not installed; install pdfrt[local] in this Python environment") from exc
+
+    tier = data.get("tier", DEFAULT_TIER)
+    log.info("[%s] Local mineru parse (tier=%s, method=%s)", pdf_path.stem, tier, data.get("parse_method", "auto"))
+    result = parse(
+        pdf_path,
+        tier=tier,
+        ocr_mode=data.get("parse_method", "auto"),
+        image_analysis=True,
+    )
+    _save_parse_result(result, pdf_path, output_dir, data)
 
 
 def _recognize_pdf_remote(pdf_path: Path, output_dir: Path, data: dict) -> None:
+    if not MINERU_API_TOKEN:
+        raise RuntimeError("MINERU_API_TOKEN (or MINERU_API_KEY) is required for remote parsing")
+
     name = pdf_path.stem
-    with pdf_path.open("rb") as f:
-        resp = requests.post(
-            f"{MINERU_API_URL}/tasks",
-            auth=MINERU_API_AUTH,
-            data=data,
-            files={"files": (pdf_path.name, f, "application/pdf")},
+    headers = {"Authorization": f"Bearer {MINERU_API_TOKEN}"}
+    file_bytes = pdf_path.read_bytes()
+    sha256 = hashlib.sha256(file_bytes).hexdigest()
+
+    resp = requests.post(
+        f"{MINERU_API_URL}/v1/uploads",
+        headers={**headers, "Content-Type": "application/json"},
+        json={
+            "filename": pdf_path.name,
+            "bytes": len(file_bytes),
+            "mime_type": "application/pdf",
+            "purpose": "parse",
+            "sha256sum": sha256,
+        },
+        timeout=300,
+    )
+    resp.raise_for_status()
+    upload = resp.json()
+    log.info("[%s] Remote upload session %s (%s)", name, upload["id"], upload["status"])
+
+    if upload.get("status") != "completed":
+        resp = requests.put(
+            upload["upload_url"],
+            data=file_bytes,
+            headers=upload.get("upload_headers") or {},
             timeout=7200,
         )
-    resp.raise_for_status()
-    task = resp.json()
-    log.info("[%s] Remote task created, status=%s", name, task["status"])
+        resp.raise_for_status()
 
-    while task["status"] in {"pending", "processing"}:
-        time.sleep(2)
-        task = requests.get(task["status_url"], auth=MINERU_API_AUTH).json()
+        resp = requests.post(
+            f"{MINERU_API_URL}/v1/uploads/{upload['id']}/complete",
+            headers={**headers, "Content-Type": "application/json"},
+            json={"sha256sum": sha256},
+            timeout=300,
+        )
+        resp.raise_for_status()
+        upload = resp.json()
 
-    assert task["status"] == "completed", task
+    file_id = upload["file"]["id"]
+    payload = {
+        "files": [{"source": {"type": "file_id", "file_id": file_id}}],
+        "tier": data.get("tier", DEFAULT_TIER),
+        "ocr_mode": data.get("ocr_mode", "auto"),
+        "output_formats": data.get("output_formats", ["markdown", "zip"]),
+    }
+    job = _create_remote_job(headers, payload, name)
+    job_id = job["job_id"]
 
-    r = requests.get(task["result_url"], auth=MINERU_API_AUTH, timeout=7200)
+    delay = 2.0
+    while job["status"] not in {"completed", "partial", "failed", "canceled"}:
+        time.sleep(delay)
+        delay = min(delay * 1.5, 30.0)
+        resp = requests.get(
+            f"{MINERU_API_URL}/v1/parse/jobs/{job_id}",
+            headers=headers,
+            timeout=300,
+        )
+        resp.raise_for_status()
+        job = resp.json()
+        log.info("[%s] Remote job %s: %s", name, job_id, job["status"])
+
+    if job["status"] != "completed":
+        err = (job.get("files") or [{}])[0].get("error")
+        raise RuntimeError(f"mineru job {job_id} ended as {job['status']}: {err}")
+
+    outputs = job["files"][0].get("output_files") or {}
+    zip_file_id = (outputs.get("zip") or {}).get("file_id")
+    if not zip_file_id:
+        raise RuntimeError(f"mineru job {job_id} returned no zip output")
+
+    r = requests.get(
+        f"{MINERU_API_URL}/v1/files/{zip_file_id}/content",
+        headers=headers,
+        allow_redirects=True,
+        timeout=7200,
+    )
     r.raise_for_status()
     (output_dir / f"{name}.zip").write_bytes(r.content)
     log.info("[%s] Remote zip downloaded (%d bytes)", name, len(r.content))
 
 
-def format_dir(directory: Path, name: str) -> None:
+def _create_remote_job(headers: dict, payload: dict, name: str) -> dict:
+    resp = requests.post(
+        f"{MINERU_API_URL}/v1/parse/jobs",
+        headers={**headers, "Content-Type": "application/json"},
+        json=payload,
+        timeout=300,
+    )
+    if resp.status_code >= 400:
+        try:
+            error = (resp.json() or {}).get("error") or {}
+        except ValueError:
+            error = {}
+        if error.get("code") == "quality_tier_unavailable" and payload.get("tier") != "standard":
+            log.warning("[%s] Remote tier %s unavailable; falling back to standard", name, payload.get("tier"))
+            payload = {**payload, "tier": "standard"}
+            resp = requests.post(
+                f"{MINERU_API_URL}/v1/parse/jobs",
+                headers={**headers, "Content-Type": "application/json"},
+                json=payload,
+                timeout=300,
+            )
+    resp.raise_for_status()
+    job = resp.json()
+    log.info("[%s] Remote job %s created (tier=%s)", name, job["job_id"], job.get("tier"))
+    return job
+
+
+def _drop_tables(result) -> None:
+    for page in result.middle_json.pages:
+        page.blocks = [block for block in page.blocks if str(block.type) not in TABLE_BLOCK_TYPES]
+
+
+def _materialize_assets(result, pdf_path: Path):
+    from docvortex.document.pdf import PDFDocument
+    from docvortex.export import materialize_middle
+
+    if pdf_path.suffix.lower() != ".pdf":
+        return materialize_middle(result.middle_json)
+
+    with PDFDocument(str(pdf_path)) as document:
+        def resolve_image(block, page_idx: int):
+            bbox = getattr(block, "bbox", None)
+            if bbox is None:
+                return None
+            try:
+                artifact = document.render_image(
+                    page_idx,
+                    bbox=tuple(float(value) for value in bbox),
+                    image_format="png",
+                )
+            except Exception as exc:
+                log.debug("[%s] Skip image at page %d: %s", pdf_path.stem, page_idx + 1, exc)
+                return None
+            return artifact.data, artifact.extension
+
+        return materialize_middle(result.middle_json, image_resolver=resolve_image)
+
+
+def _save_parse_result(result, pdf_path: Path, output_dir: Path, data: dict) -> None:
+    from mineru.parser import ParseResult
+
+    if str(data.get("table_enable", "false")).lower() != "true":
+        _drop_tables(result)
+
+    middle_json, assets = _materialize_assets(result, pdf_path)
+    method = data.get("parse_method") or data.get("ocr_mode") or "auto"
+    gen_dir = output_dir / pdf_path.stem / method
+    gen_dir.mkdir(parents=True, exist_ok=True)
+
+    markdown = ParseResult(middle_json=middle_json).markdown()
+    (gen_dir / f"{pdf_path.stem}.md").write_text(markdown, encoding="utf-8")
+    for relative_path, payload in assets.items():
+        target = gen_dir / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
+    log.info("[%s] Parsed markdown written (%d image asset(s))", pdf_path.stem, len(assets))
+
+
+def remove_markdown_tables(text: str) -> str:
+    text = re.sub(r"<table\b.*?</table>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    lines = text.splitlines()
+    output: list[str] = []
+    index = 0
+    separator = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$")
+    while index < len(lines):
+        line = lines[index]
+        if (
+            "|" in line
+            and index + 1 < len(lines)
+            and separator.match(lines[index + 1])
+        ):
+            index += 2
+            while index < len(lines) and lines[index].strip() and "|" in lines[index]:
+                index += 1
+            continue
+        output.append(line)
+        index += 1
+    return "\n".join(output)
+
+
+def format_dir(directory: Path, name: str, table_enable: bool = False) -> None:
     zip_path = directory / f"{name}.zip"
+    extracted: set[Path] = set()
     if zip_path.exists():
         with zipfile.ZipFile(zip_path) as zf:
+            members = zf.namelist()
             zf.extractall(directory)
         zip_path.unlink()
+        extracted = {directory / m.rstrip("/") for m in members}
 
     gen_dir = directory / name
+
+    # markdown: {name}/<method>/{name}.md (local mineru) or full.md (official remote zip)
     md_candidates = list(gen_dir.rglob(f"{name}.md")) if gen_dir.exists() else []
+    if not md_candidates and (directory / "full.md").exists():
+        md_candidates = [directory / "full.md"]
     source_md = md_candidates[0] if md_candidates else None
+
+    # images: {name}/<method>/images (local mineru) or images/ (official remote zip)
+    img_candidates = list(gen_dir.rglob("images")) if gen_dir.exists() else []
+    source_images = next((d for d in img_candidates if d.is_dir()), None)
+    if source_images is None and (directory / "images").is_dir():
+        source_images = directory / "images"
 
     target_md = directory / f"{name}.md"
     if source_md and source_md.exists():
         source_md.replace(target_md)
 
-    img_candidates = list(gen_dir.rglob("images")) if gen_dir.exists() else []
-    source_images = next((d for d in img_candidates if d.is_dir()), None)
     target_images = directory / f"{name}_images"
     if source_images and source_images.exists():
         if target_images.exists():
@@ -176,11 +343,17 @@ def format_dir(directory: Path, name: str) -> None:
     if not target_md.exists():
         raise FileNotFoundError(f"Could not find the Markdown file generated by mineru: {target_md}")
 
-    get_hierarchical_title(target_md, target_md)
-    replace_image_paths(target_md, target_md, name)
-
     if gen_dir.exists():
         shutil.rmtree(gen_dir)
+    for entry in extracted:
+        if entry.is_file():
+            entry.unlink(missing_ok=True)
+
+    if not table_enable:
+        target_md.write_text(remove_markdown_tables(target_md.read_text(encoding="utf-8")), encoding="utf-8")
+
+    get_hierarchical_title(target_md, target_md)
+    replace_image_paths(target_md, target_md, name)
 
 
 def extract_titles_from_markdown(text: str) -> list[str]:
@@ -254,15 +427,8 @@ def replace_titles_in_text(text: str, original_titles: list[str], new_hierarchy:
 
 def replace_image_paths(input_file: Path, output_file: Path, name: str) -> None:
     md_content = input_file.read_text(encoding="utf-8")
-    replaced_content = re.sub(r"!\[\]\(images/", f"![]({name}_images/", md_content)
+    replaced_content = re.sub(r"!\[([^\]]*)\]\(images/", rf"![\1]({name}_images/", md_content)
     output_file.write_text(replaced_content, encoding="utf-8")
-
-
-def translate_markdown(work_dir: Path, name: str) -> None:
-    input_file = work_dir / f"{name}.md"
-    output_file = work_dir / f"{name}_{TARGET_LANGUAGE}.md"
-    asyncio.run(translate(input_file, output_file, name))
-    input_file.unlink(missing_ok=True)
 
 
 def merge_chunks(chunks: list[tuple[str, str]], threshold: int = MAX_CHUNK) -> list[tuple[str, str]]:
@@ -451,25 +617,22 @@ def build_data(mode: str, args) -> dict:
     def opt(val):
         return str(val).lower() if isinstance(val, bool) else val
 
-    if args.backend:
-        default["backend"] = args.backend
+    if args.tier:
+        default["tier"] = args.tier
 
     if mode == "remote":
-        if args.effort:
-            default["effort"] = args.effort
-        if args.table is not None:
-            default["table_enable"] = opt(args.table)
-        if args.image_analysis is not None:
-            default["image_analysis"] = opt(args.image_analysis)
-    else:
         if args.method:
-            default["parse_method"] = args.method
-        if args.lang:
-            default["lang"] = args.lang
-        if args.formula is not None:
-            default["formula_enable"] = opt(args.formula)
+            default["ocr_mode"] = args.method
         if args.table is not None:
             default["table_enable"] = opt(args.table)
+        return default
+
+    if args.method:
+        default["parse_method"] = args.method
+    if args.formula is not None:
+        default["formula_enable"] = opt(args.formula)
+    if args.table is not None:
+        default["table_enable"] = opt(args.table)
     return default
 
 
@@ -486,7 +649,17 @@ def collect_pdfs(paths: list[str]) -> list[Path]:
     return pdfs
 
 
-async def process_one_pdf(pdf_path: Path, mode: str, data: dict) -> None:
+ALL_STEPS = ("recognize", "format", "translate", "generate")
+
+
+def resolve_steps(args) -> list[str]:
+    steps = [step for step in ALL_STEPS if getattr(args, step)]
+    if args.all or not steps:
+        return list(ALL_STEPS)
+    return steps
+
+
+async def run_full_pipeline(pdf_path: Path, mode: str, data: dict) -> None:
     name = pdf_path.stem
 
     dest_dir = pdf_path.parent
@@ -503,7 +676,7 @@ async def process_one_pdf(pdf_path: Path, mode: str, data: dict) -> None:
         await asyncio.to_thread(recognize_pdf, pdf_path, work_dir, mode, data)
 
         log.info("[%s] [2/4] Formatting Markdown ...", name)
-        await asyncio.to_thread(format_dir, work_dir, name)
+        await asyncio.to_thread(format_dir, work_dir, name, str(data.get("table_enable", "false")).lower() == "true")
 
         log.info("[%s] [3/4] Translating to Chinese ...", name)
         await translate(work_dir / f"{name}.md", work_dir / f"{name}_{TARGET_LANGUAGE}.md", name)
@@ -526,20 +699,52 @@ async def process_one_pdf(pdf_path: Path, mode: str, data: dict) -> None:
     log.info("[%s] Done: %s", name, md_out)
 
 
-async def run_batch(pdf_paths: list[Path], mode: str, data: dict) -> None:
+async def process_one_pdf(pdf_path: Path, mode: str, data: dict, steps: list[str]) -> None:
+    if steps == list(ALL_STEPS):
+        await run_full_pipeline(pdf_path, mode, data)
+        return
+
+    name = pdf_path.stem
+    dest_dir = pdf_path.parent
+
+    if "recognize" in steps:
+        log.info("[%s] Recognizing PDF (mode=%s) ...", name, mode)
+        await asyncio.to_thread(recognize_pdf, pdf_path, dest_dir, mode, data)
+
+    if "format" in steps:
+        log.info("[%s] Formatting Markdown ...", name)
+        await asyncio.to_thread(format_dir, dest_dir, name, str(data.get("table_enable", "false")).lower() == "true")
+
+    if "translate" in steps:
+        log.info("[%s] Translating to Chinese ...", name)
+        await translate(dest_dir / f"{name}.md", dest_dir / f"{name}_{TARGET_LANGUAGE}.md", name)
+        (dest_dir / f"{name}.md").unlink(missing_ok=True)
+
+    if "generate" in steps:
+        log.info("[%s] Generating summary ...", name)
+        await asyncio.to_thread(get_summary, dest_dir, name)
+
+    log.info("[%s] Steps done: %s", name, "+".join(steps))
+
+
+async def run_batch(pdf_paths: list[Path], mode: str, data: dict, steps: list[str]) -> bool:
     sem = asyncio.Semaphore(MAX_CONCURRENT_PDFS)
     pbar = tqdm(total=len(pdf_paths), desc="Batch", unit="file")
 
-    async def run_one(pdf_path: Path) -> None:
+    async def run_one(pdf_path: Path) -> bool:
         async with sem:
             try:
-                await process_one_pdf(pdf_path, mode, data)
+                await process_one_pdf(pdf_path, mode, data, steps)
+                return True
             except Exception as e:
                 log.error("[%s] Failed: %s", pdf_path.stem, e)
-            pbar.update(1)
+                return False
+            finally:
+                pbar.update(1)
 
-    await asyncio.gather(*(run_one(p) for p in pdf_paths))
+    results = await asyncio.gather(*(run_one(p) for p in pdf_paths))
     pbar.close()
+    return all(results)
 
 
 def main():
@@ -550,30 +755,60 @@ def main():
         usage="pdfrt <file.pdf|dir> [<file.pdf|dir> ...] [options]",
     )
     parser.add_argument("paths", nargs="+", help="PDF file(s) or directory(ies)")
+    parser.add_argument("--recognize", "-r", action="store_true",
+                        help="run only the PDF recognition step")
+    parser.add_argument("--format", "-f", action="store_true",
+                        help="run only the Markdown formatting step")
+    parser.add_argument("--translate", "-t", action="store_true",
+                        help="run only the translation step")
+    parser.add_argument("--generate", "-g", action="store_true",
+                        help="run only the summary generation step")
+    parser.add_argument("--all", "-a", action="store_true",
+                        help="run all steps (default when no step flag is given)")
     parser.add_argument("--mode", choices=["local", "remote"], default="local",
                         help="mineru backend: local (default) or remote")
-    parser.add_argument("--backend", default=None, help="override backend")
-    parser.add_argument("--method", default=None, help="parse method (local only)")
-    parser.add_argument("--lang", default=None, help="OCR language (local only)")
+    parser.add_argument("--tier", choices=["flash", "basic", "standard", "advanced"], default=None,
+                        help="mineru parse tier (default: advanced)")
+    parser.add_argument("--method", choices=["auto", "txt", "ocr"], default=None,
+                        help="parse method (local) or OCR mode (remote)")
     parser.add_argument("--formula", type=lambda x: x.lower() == "true", default=None,
-                        help="enable formula (local only)")
+                        help="enable formula (kept for compatibility)")
     parser.add_argument("--table", type=lambda x: x.lower() == "true", default=None,
-                        help="enable table")
-    parser.add_argument("--effort", default=None, help="parsing effort (remote only)")
-    parser.add_argument("--image-analysis", type=lambda x: x.lower() == "true", default=None,
-                        help="enable image analysis (remote only)")
+                        help="enable table parsing (default: false)")
     args = parser.parse_args()
 
+    steps = resolve_steps(args)
     pdf_paths = collect_pdfs(args.paths)
     if not pdf_paths:
         log.error("No PDF files found.")
         sys.exit(1)
 
+    required = []
+    if "translate" in steps or "generate" in steps:
+        required.extend(("MODEL_ID", "API_BASE_URL", "API_KEY"))
+    missing = [name for name in required if not os.environ.get(name)]
+    if args.mode == "remote" and "recognize" in steps and not MINERU_API_TOKEN:
+        missing.append("MINERU_API_TOKEN")
+    if missing:
+        parser.error(f"missing configuration: {', '.join(missing)}")
+
     data = build_data(args.mode, args)
-    log.info("Batch size: %d  (concurrency: %d, mode: %s, data: %s)",
-             len(pdf_paths), MAX_CONCURRENT_PDFS, args.mode, data)
-    asyncio.run(run_batch(pdf_paths, args.mode, data))
-    log.info("All done.")
+    log.info("Batch size: %d  (concurrency: %d, mode: %s, steps: %s, data: %s)",
+             len(pdf_paths), MAX_CONCURRENT_PDFS, args.mode, "+".join(steps), data)
+    ok = asyncio.run(run_batch(pdf_paths, args.mode, data, steps))
+    if ok:
+        log.info("All done.")
+    if args.mode == "local" and "recognize" in steps:
+        try:
+            from mineru.model.vlm.runtime import shutdown_cached_models
+            shutdown_cached_models()
+        except Exception as exc:
+            log.debug("MinerU runtime shutdown skipped: %s", exc)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0 if ok else 1)
+    if not ok:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
